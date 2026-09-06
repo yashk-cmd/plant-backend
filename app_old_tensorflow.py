@@ -1,10 +1,15 @@
 """
-Plant Pathology Identification System — Backend API (Lightweight version)
----------------------------------------------------------------------------
-Uses a TensorFlow Lite model via `ai-edge-litert`, a lightweight interpreter
-package (NOT the full TensorFlow library). This drastically reduces memory
-usage — a critical fix for free-tier hosts like Render's 512MB limit, since
-the full TensorFlow package alone can consume 300-500MB just being imported.
+Plant Pathology Identification System — Backend API
+-----------------------------------------------------
+Wraps a trained Keras/TensorFlow CNN (ResNet / MobileNet / VGG16 /
+EfficientNet trained on PlantVillage) behind a REST endpoint that the
+AI Studio frontend can call.
+
+Run locally:
+    pip install -r requirements.txt
+    python app.py
+
+Then POST an image to: http://localhost:5000/predict
 """
 
 import io
@@ -14,15 +19,19 @@ import numpy as np
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from PIL import Image
-from ai_edge_litert.interpreter import Interpreter
+from tensorflow.keras.models import load_model
 
 # ----------------------------------------------------------------------
-# CONFIG
+# CONFIG — edit these to match your actual trained model
 # ----------------------------------------------------------------------
 
-MODEL_PATH = "plant_disease_model.tflite"   # the CONVERTED model, not .h5
-IMAGE_SIZE = (224, 224)
+MODEL_PATH = "plant_disease_model.h5"      # TODO: path to your saved model
+IMAGE_SIZE = (224, 224)                    # TODO: match your model's input size
+                                            # (EfficientNetB2/B3 etc. use larger sizes)
 
+# TODO: replace with your actual class labels, in the exact order your
+# model's output layer was trained with (check train_generator.class_indices
+# or similar from your training script — order MUST match exactly).
 CLASS_NAMES = [
     "Pepper__bell___Bacterial_spot",
     "Pepper__bell___healthy",
@@ -41,18 +50,18 @@ CLASS_NAMES = [
     "Tomato_healthy",
 ]
 
-CONFIDENCE_THRESHOLD = 0.90  # raised earlier after the car-image false positive
+# Below this confidence, we refuse to give a diagnosis rather than
+# guess — this is your main defense against random/non-leaf images,
+# since the model itself has no "not a leaf" class.
+CONFIDENCE_THRESHOLD = 0.70
 
 # ----------------------------------------------------------------------
 
 app = Flask(__name__)
-CORS(app)
+CORS(app)  # allow requests from your AI Studio frontend's domain
 
-print("Loading TFLite model...")
-interpreter = Interpreter(model_path=MODEL_PATH)
-interpreter.allocate_tensors()
-input_details = interpreter.get_input_details()
-output_details = interpreter.get_output_details()
+print("Loading model...")
+model = load_model(MODEL_PATH)
 print("Model loaded.")
 
 
@@ -62,30 +71,39 @@ def allowed_file(filename: str) -> bool:
 
 
 def preprocess_image(file_bytes: bytes) -> np.ndarray:
+    """Load, resize, and normalize the image the same way it was
+    preprocessed during training. Adjust the normalization line below
+    to match your training pipeline (e.g. rescale=1./255, or the
+    specific preprocess_input() for ResNet/MobileNet/EfficientNet)."""
     img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
     img = img.resize(IMAGE_SIZE)
     arr = np.array(img).astype("float32")
-    arr = arr / 255.0  # matches training preprocessing
+
+    # TODO: match this to your training preprocessing exactly.
+    # Example for simple rescale:
+    arr = arr / 255.0
+    # Example if you used a Keras applications preprocess_input instead:
+    # from tensorflow.keras.applications.resnet50 import preprocess_input
+    # arr = preprocess_input(arr)
+
     return np.expand_dims(arr, axis=0)
 
 
 def is_likely_leaf_image(arr: np.ndarray) -> bool:
-    """Lightweight placeholder guardrail — see earlier notes. Still just a
-    heuristic, not a trained classifier."""
+    """Lightweight placeholder guardrail to catch obviously non-leaf
+    images before they hit the disease model. This is NOT a trained
+    classifier — it's a rough heuristic (dominant green/vegetation
+    color ratio) to filter out extreme non-plant cases.
+
+    For a real solution, train a small binary "leaf vs not-leaf"
+    classifier and swap it in here — the confidence threshold on the
+    main model is your primary and more reliable guardrail.
+    """
     img = (arr[0] * 255).astype("uint8")
     r, g, b = img[:, :, 0], img[:, :, 1], img[:, :, 2]
     green_dominant = (g.astype(int) > r.astype(int)) & (g.astype(int) > b.astype(int))
     green_ratio = green_dominant.mean()
-    return green_ratio > 0.25
-
-
-def run_inference(processed: np.ndarray) -> np.ndarray:
-    """Runs one forward pass through the TFLite interpreter and returns the
-    raw output prediction array (softmax probabilities)."""
-    interpreter.set_tensor(input_details[0]["index"], processed)
-    interpreter.invoke()
-    output = interpreter.get_tensor(output_details[0]["index"])
-    return output[0]
+    return green_ratio > 0.15  # very loose threshold, tune or replace
 
 
 @app.route("/health", methods=["GET"])
@@ -119,7 +137,7 @@ def predict():
                         "Please upload a clear photo of a single leaf."
         }), 200
 
-    predictions = run_inference(processed)
+    predictions = model.predict(processed)[0]
     top_idx = int(np.argmax(predictions))
     confidence = float(predictions[top_idx])
 
@@ -138,6 +156,8 @@ def predict():
         "result": "success",
         "disease": disease_name,
         "confidence": round(confidence * 100, 2),
+        # TODO: pull from a dictionary of descriptions per class if you
+        # want a short explanation shown alongside the result
         "description": f"Detected: {disease_name.replace('___', ' - ').replace('_', ' ')}"
     })
 
